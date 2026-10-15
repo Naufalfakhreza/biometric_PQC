@@ -1,24 +1,24 @@
 import base64
 import time
 import secrets
-import jwt
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from pqc_engine import (
     EK_SIZE,
     encapsulate_challenge,
-    compute_proof_hash,
+    compute_proof_hmac,
+    generate_ml_dsa_keypair,
+    issue_pqc_token,
+    verify_pqc_token,
 )
 
-app = FastAPI(title="Post-Quantum ML-KEM Face Auth Server")
+app = FastAPI(title="Post-Quantum ML-KEM & ML-DSA Face Auth Server")
 
-JWT_SECRET = secrets.token_hex(32)
-JWT_ALGORITHM = "HS256"
+SERVER_DSA_PK, SERVER_DSA_SK = generate_ml_dsa_keypair()
 CHALLENGE_TTL_SECONDS = 60
 
-# In-memory stores (Replace with PostgreSQL + Redis in production)
-USER_DB: dict[str, bytes] = {}               # user_id -> ek (bytes)
-ACTIVE_CHALLENGES: dict[str, dict] = {}      # user_id -> {"expected_hash": str, "expires_at": float}
+USER_DB: dict[str, bytes] = {}               
+ACTIVE_CHALLENGES: dict[str, dict] = {}      
 
 
 class RegisterRequest(BaseModel):
@@ -32,7 +32,7 @@ class ChallengeRequest(BaseModel):
 
 class VerifyRequest(BaseModel):
     user_id: str
-    proof_hash: str
+    proof_hmac: str
 
 
 @app.post("/register", status_code=201)
@@ -58,12 +58,11 @@ def create_login_challenge(req: ChallengeRequest):
     if not ek_bytes:
         raise HTTPException(status_code=404, detail="User not registered.")
 
-    # FIPS 203 Encapsulation: generates (K, C)
     shared_secret_k, ciphertext_c = encapsulate_challenge(ek_bytes)
-    expected_proof = compute_proof_hash(shared_secret_k, req.user_id)
+    expected_hmac = compute_proof_hmac(shared_secret_k, req.user_id, ciphertext_c)
 
     ACTIVE_CHALLENGES[req.user_id] = {
-        "expected_hash": expected_proof,
+        "expected_hmac": expected_hmac,
         "expires_at": time.time() + CHALLENGE_TTL_SECONDS,
     }
 
@@ -84,16 +83,27 @@ def verify_login_proof(req: VerifyRequest):
     if time.time() > challenge["expires_at"]:
         raise HTTPException(status_code=401, detail="Challenge expired (QA-10).")
 
-    # Constant-time string comparison against timing attacks
-    if not secrets.compare_digest(req.proof_hash, challenge["expected_hash"]):
+    if not secrets.compare_digest(req.proof_hmac, challenge["expected_hmac"]):
         raise HTTPException(status_code=401, detail="Invalid cryptographic proof.")
 
-    token_payload = {
-        "sub": req.user_id,
-        "auth_method": "local_face_ml_kem_768",
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600,
-    }
-    access_token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    pqc_token = issue_pqc_token(SERVER_DSA_SK, req.user_id)
 
-    return {"status": "authenticated", "access_token": access_token}
+    return {
+        "status": "authenticated",
+        "token_type": "ML-DSA-65",
+        "access_token": pqc_token,
+    }
+
+
+@app.get("/me")
+def get_authenticated_user(authorization: str = Header(...)):
+    """Protected route that verifies the ML-DSA-65 Post-Quantum signature."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token.")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        claims = verify_pqc_token(SERVER_DSA_PK, token)
+        return {"verified_claims": claims}
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))

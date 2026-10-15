@@ -1,35 +1,37 @@
 import base64
+import json
 import os
 import sys
 import time
 import cv2
 import httpx
 import keyring
+import numpy as np
 from deepface import DeepFace
 from pqc_engine import (
     generate_ml_kem_keypair,
     decapsulate_challenge,
-    compute_proof_hash,
+    compute_proof_hmac,
 )
 
 SERVER_URL = "http://127.0.0.1:8000"
 KEYRING_SERVICE = "PQC_FaceAuth_Enclave"
 ENCLAVE_DIR = "local_enclave"
 
-# Change CAMERA_INDEX to 1 or 2 if index 0 points to a virtual camera (e.g., OBS)
 CAMERA_INDEX = 0
-# Options: 'opencv', 'ssd', 'mtcnn', 'retinaface'
 DETECTOR_BACKEND = "retinaface"
+ARCFACE_COSINE_THRESHOLD = 0.68  
 
-# Windows Credential Manager limit workaround (3,200 Base64 chars split into 4x800 chunks)
+ENABLE_ANTI_SPOOFING = False
+
 CHUNK_SIZE = 800
 NUM_CHUNKS = 4
 
 os.makedirs(ENCLAVE_DIR, exist_ok=True)
 
 
+#Splits the ML-KEM-768 key into 4 chunks for Windows Credential Manager.
 def save_dk_to_keyring(user_id: str, dk_bytes: bytes):
-    """Splits the 3,200-char Base64 ML-KEM-768 key into 4 chunks for Windows Credential Manager."""
     dk_b64 = base64.b64encode(dk_bytes).decode("utf-8")
     chunks = [dk_b64[i : i + CHUNK_SIZE] for i in range(0, len(dk_b64), CHUNK_SIZE)]
 
@@ -37,8 +39,8 @@ def save_dk_to_keyring(user_id: str, dk_bytes: bytes):
         keyring.set_password(KEYRING_SERVICE, f"{user_id}_part_{idx}", chunk)
 
 
+#Reassembles the ML-KEM private key chunks from Windows Credential Manager.
 def load_dk_from_keyring(user_id: str) -> bytes | None:
-    """Reassembles the ML-KEM-768 private key chunks from Windows Credential Manager."""
     chunks = []
     for idx in range(NUM_CHUNKS):
         part = keyring.get_password(KEYRING_SERVICE, f"{user_id}_part_{idx}")
@@ -50,18 +52,17 @@ def load_dk_from_keyring(user_id: str) -> bytes | None:
     return base64.b64decode(dk_b64)
 
 
-def capture_webcam_frame(window_prompt: str) -> str:
-    """Flushes the camera buffer via terminal prompt so auto-exposure adjusts before saving."""
+#Captures a webcam frame directly into RAM without saving any raw photo to disk.
+def capture_frame_in_memory(window_prompt: str) -> np.ndarray:
     input(f"\n[CAMERA] {window_prompt} - Look at the camera and press ENTER to capture...")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         raise RuntimeError(f"Could not access webcam at index {CAMERA_INDEX}.")
 
-    print("[CAMERA] Warming up sensor & adjusting auto-exposure...")
+    print("[CAMERA] Warming up sensor & adjusting auto-exposure in RAM...")
     time.sleep(0.5)
 
-    # Flush 30 frames (~1 second) so the webcam adjusts gain and clears dark initial frames
     frame = None
     for _ in range(30):
         ret, temp_frame = cap.read()
@@ -74,70 +75,81 @@ def capture_webcam_frame(window_prompt: str) -> str:
         raise RuntimeError("Failed to read frames from webcam.")
 
     brightness = frame.mean()
-    print(f"[CAMERA] Frame captured (Average Brightness: {brightness:.1f}/255).")
+    print(f"[CAMERA] Frame captured in RAM (Average Brightness: {brightness:.1f}/255).")
     if brightness < 5.0:
         print("[WARNING] Captured frame is nearly pitch black! Check your camera cover or CAMERA_INDEX.")
 
-    temp_path = os.path.join(ENCLAVE_DIR, "live_capture.jpg")
-    cv2.imwrite(temp_path, frame)
-    return temp_path
+    return frame
 
 
-def verify_face_locally(user_id: str, live_img_path: str) -> bool:
-    """Runs on-device ArcFace verification inside the local enclave."""
-    ref_img_path = os.path.join(ENCLAVE_DIR, f"{user_id}_reference.jpg")
-    if not os.path.exists(ref_img_path):
-        print("[ERROR] No local biometric template found for this user.")
+#Extracts the ArcFace vector directly from the RAM frame.
+def extract_face_embedding(frame: np.ndarray) -> list[float]:
+    representations = DeepFace.represent(
+        img_path=frame,
+        model_name="ArcFace",
+        detector_backend=DETECTOR_BACKEND,
+        enforce_detection=True,
+        anti_spoofing=ENABLE_ANTI_SPOOFING,
+    )
+    return representations[0]["embedding"]
+
+
+#Compares live facial embedding against stored vector using Cosine Distance in RAM.
+def verify_face_in_memory(user_id: str, live_frame: np.ndarray) -> bool:
+    emb_path = os.path.join(ENCLAVE_DIR, f"{user_id}_embedding.json")
+    if not os.path.exists(emb_path):
+        print("[ERROR] No local biometric embedding found for this user. Run `enroll` first.")
         return False
+
+    with open(emb_path, "r") as f:
+        ref_embedding = np.array(json.load(f), dtype=np.float64)
 
     try:
-        result = DeepFace.verify(
-            img1_path=live_img_path,
-            img2_path=ref_img_path,
-            model_name="ArcFace",
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=True,
-        )
-        distance = result.get("distance", 1.0)
-        verified = result.get("verified", False)
-        print(f"[BIOMETRIC TEE] Match Verified: {verified} (Cosine Distance: {distance:.4f})")
-        return verified
-    except ValueError:
-        debug_path = os.path.join(ENCLAVE_DIR, "debug_failed_capture.jpg")
-        if os.path.exists(live_img_path):
-            os.replace(live_img_path, debug_path)
-        print(f"[BIOMETRIC TEE] Face detection failed. Saved image to '{debug_path}' for inspection.")
+        live_embedding = np.array(extract_face_embedding(live_frame), dtype=np.float64)
+    except ValueError as e:
+        print(f"[BIOMETRIC TEE] Face/Liveness check failed: {e}")
         return False
 
+    # Cosine Distance = 1 - (A . B) / (||A|| * ||B||)
+    dot_product = np.dot(live_embedding, ref_embedding)
+    norm_product = np.linalg.norm(live_embedding) * np.linalg.norm(ref_embedding)
+    cosine_distance = float(1.0 - (dot_product / norm_product))
 
+    verified = cosine_distance <= ARCFACE_COSINE_THRESHOLD
+    print(
+        f"[BIOMETRIC TEE] Match Verified: {verified} "
+        f"(Cosine Distance: {cosine_distance:.4f} / Threshold: {ARCFACE_COSINE_THRESHOLD})"
+    )
+    return verified
+
+
+#Extracts 512-D face vector in RAM, generates ML-KEM keys, and registers pk_user.
 def enroll_user(user_id: str):
-    """Captures reference face, generates ML-KEM-768 keys, and registers pk_user with server."""
+    
     print(f"=== Enrolling User: {user_id} ===")
-    captured_path = capture_webcam_frame(f"Enroll Face: {user_id}")
+    frame = capture_frame_in_memory(f"Enroll Face: {user_id}")
 
     try:
-        DeepFace.extract_faces(
-            img_path=captured_path,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=True,
-        )
-    except ValueError:
-        debug_path = os.path.join(ENCLAVE_DIR, "debug_failed_capture.jpg")
-        os.replace(captured_path, debug_path)
-        print(f"[ERROR] No clear face detected. Open '{debug_path}' to check what your camera captured.")
+        embedding = extract_face_embedding(frame)
+    except ValueError as e:
+        print(f"[ERROR] Enrollment aborted: No clear/live face detected ({e}).")
         return
+    finally:
+        del frame 
 
-    ref_img_path = os.path.join(ENCLAVE_DIR, f"{user_id}_reference.jpg")
-    os.replace(captured_path, ref_img_path)
+    emb_path = os.path.join(ENCLAVE_DIR, f"{user_id}_embedding.json")
+    with open(emb_path, "w") as f:
+        json.dump(embedding, f)
+    print(f"[ENCLAVE] Saved 512-D facial vector to '{emb_path}' (no photo saved to disk).")
 
-    # Generate NIST ML-KEM-768 Keypair
+    old_jpg = os.path.join(ENCLAVE_DIR, f"{user_id}_reference.jpg")
+    if os.path.exists(old_jpg):
+        os.remove(old_jpg)
+
     ek, dk = generate_ml_kem_keypair()
-
-    # Store Private Key (dk) in OS Keyring across 4 safe-sized chunks
     save_dk_to_keyring(user_id, dk)
     print("[ENCLAVE] ML-KEM-768 Private Key (dk) locked in OS Keyring.")
 
-    # Send Public Key (ek) to Authentication Server
     ek_b64 = base64.b64encode(ek).decode("utf-8")
     with httpx.Client() as client:
         resp = client.post(
@@ -148,28 +160,24 @@ def enroll_user(user_id: str):
         print(f"[SERVER] Registration Success: {resp.json()}")
 
 
+#Verifies face vector in RAM -> Unlocks ML-KEM Key -> Receives ML-DSA PQC Token.
 def authenticate_user(user_id: str):
-    """Executes On-Device Face Verification -> Unlocks ML-KEM Key -> Solves Server Challenge."""
     print(f"=== Authenticating User: {user_id} ===")
 
-    # Step 1: Capture & Verify Face Locally (Biometric Gate)
-    live_path = capture_webcam_frame(f"Verify Face: {user_id}")
-    is_matched = verify_face_locally(user_id, live_path)
-    if os.path.exists(live_path):
-        os.remove(live_path)  # Immediately wipe live capture from disk
+    live_frame = capture_frame_in_memory(f"Verify Face: {user_id}")
+    is_matched = verify_face_in_memory(user_id, live_frame)
+    del live_frame  
 
     if not is_matched:
         print("[ACCESS DENIED] Biometric verification failed. Secure Enclave remains locked.")
         return
 
-    # Step 2: Unlock Private Key (dk) from OS Keyring
     dk_bytes = load_dk_from_keyring(user_id)
     if not dk_bytes:
         print("[ERROR] Private key not found in OS Keyring.")
         return
 
     with httpx.Client() as client:
-        # Step 3: Request ML-KEM Challenge Ciphertext (C) from Server
         chal_resp = client.post(f"{SERVER_URL}/login/challenge", json={"user_id": user_id})
         if chal_resp.status_code != 200:
             print(f"[SERVER ERROR] Challenge failed: {chal_resp.text}")
@@ -177,21 +185,30 @@ def authenticate_user(user_id: str):
 
         ciphertext_c = base64.b64decode(chal_resp.json()["ciphertext_b64"])
 
-        # Step 4: Decapsulate C -> K inside Client Enclave and Hash Proof H(K)
         shared_secret_k = decapsulate_challenge(dk_bytes, ciphertext_c)
-        proof_hash = compute_proof_hash(shared_secret_k, user_id)
+        proof_hmac = compute_proof_hmac(shared_secret_k, user_id, ciphertext_c)
 
-        # Step 5: Send Proof Hash H(K) to Server
+        del dk_bytes, shared_secret_k
+
         verify_resp = client.post(
             f"{SERVER_URL}/login/verify",
-            json={"user_id": user_id, "proof_hash": proof_hash},
+            json={"user_id": user_id, "proof_hmac": proof_hmac},
         )
-        if verify_resp.status_code == 200:
-            data = verify_resp.json()
-            print("\n[LOGIN SUCCESS] Post-Quantum Handshake Verified!")
-            print(f"JWT Access Token: {data['access_token'][:60]}...")
-        else:
+        if verify_resp.status_code != 200:
             print(f"\n[LOGIN FAILED] Server rejected proof: {verify_resp.text}")
+            return
+
+        data = verify_resp.json()
+        pqc_token = data["access_token"]
+        print("\n[LOGIN SUCCESS] Post-Quantum Handshake Verified!")
+        print(f"Token Algorithm : {data['token_type']} (NIST FIPS 204)")
+        print(f"PQC Token (len) : {len(pqc_token)} chars ({pqc_token[:50]}...)")
+
+        me_resp = client.get(
+            f"{SERVER_URL}/me",
+            headers={"Authorization": f"Bearer {pqc_token}"},
+        )
+        print(f"[PROTECTED API] /me verification result: {me_resp.json()}")
 
 
 if __name__ == "__main__":

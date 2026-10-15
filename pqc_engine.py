@@ -1,34 +1,31 @@
+import base64
 import hashlib
+import hmac
+import json
+import time
 from kyber_py.ml_kem import ML_KEM_768
-
-# NIST FIPS 203 ML-KEM-768 byte length constants
-EK_SIZE = 1184  # Public Encapsulation Key (pk_user)
-DK_SIZE = 2400  # Private Decapsulation Key (sk_user)
-CT_SIZE = 1088  # Ciphertext Challenge (C)
+from dilithium_py.ml_dsa import ML_DSA_65
 
 
+EK_SIZE = 1184  
+DK_SIZE = 2400  
+CT_SIZE = 1088  
+
+
+#Generates an ML-KEM-768 key pair.
 def generate_ml_kem_keypair() -> tuple[bytes, bytes]:
-    """Generates an ML-KEM-768 (encapsulation_key, decapsulation_key) pair."""
-    ek, dk = ML_KEM_768.keygen()
-    return ek, dk
+    return ML_KEM_768.keygen()
 
 
+#Generates shared secret and ciphertext.
 def encapsulate_challenge(ek: bytes) -> tuple[bytes, bytes]:
-    """
-    Server-side: Uses user's public encapsulation key (ek) to generate
-    a 32-byte shared secret (K) and 1088-byte ciphertext (C).
-    """
     if len(ek) != EK_SIZE:
         raise ValueError(f"Invalid ML-KEM-768 public key length: expected {EK_SIZE}, got {len(ek)}")
-    shared_secret_k, ciphertext_c = ML_KEM_768.encaps(ek)
-    return shared_secret_k, ciphertext_c
+    return ML_KEM_768.encaps(ek)
 
 
+#Recovers shared secret from ciphertext.
 def decapsulate_challenge(dk: bytes, ciphertext_c: bytes) -> bytes:
-    """
-    Client-side: Uses private decapsulation key (dk) to recover the 32-byte
-    shared secret (K) from ciphertext (C). Implements FIPS 203 implicit rejection.
-    """
     if len(dk) != DK_SIZE:
         raise ValueError("Invalid ML-KEM-768 private key length.")
     if len(ciphertext_c) != CT_SIZE:
@@ -36,9 +33,51 @@ def decapsulate_challenge(dk: bytes, ciphertext_c: bytes) -> bytes:
     return ML_KEM_768.decaps(dk, ciphertext_c)
 
 
-def compute_proof_hash(shared_secret_k: bytes, user_id: str) -> str:
-    """Binds the shared secret K to the user_id via SHA3-256 to create H(K)."""
-    hasher = hashlib.sha3_256()
-    hasher.update(shared_secret_k)
-    hasher.update(user_id.encode("utf-8"))
-    return hasher.hexdigest()
+#Computes transcript-bound HMAC-SHA3-256 keyed with shared secret K over (user_id || ciphertext_c).
+def compute_proof_hmac(shared_secret_k: bytes, user_id: str, ciphertext_c: bytes) -> str:
+    mac = hmac.new(key=shared_secret_k, digestmod=hashlib.sha3_256)
+    mac.update(user_id.encode("utf-8"))
+    mac.update(ciphertext_c)
+    return mac.hexdigest()
+
+
+#Generates an ML-DSA pair for token signing.
+def generate_ml_dsa_keypair() -> tuple[bytes, bytes]:
+    return ML_DSA_65.keygen()
+
+
+#Signs a JSON token payload using NIST FIPS 204 ML-DSA.
+def issue_pqc_token(server_sk: bytes, user_id: str, ttl_seconds: int = 3600) -> str:
+    payload = {
+        "sub": user_id,
+        "alg": "ML-DSA-65",
+        "auth": "local_arcface_ml_kem_768",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + ttl_seconds,
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8")
+
+    signature = ML_DSA_65.sign(server_sk, payload_bytes)
+    sig_b64 = base64.urlsafe_b64encode(signature).decode("utf-8")
+
+    return f"{payload_b64}.{sig_b64}"
+
+
+#Verifies an ML-DSA signed token and checks its expiration timestamp.
+def verify_pqc_token(server_pk: bytes, token: str) -> dict:
+    try:
+        payload_b64, sig_b64 = token.split(".")
+        payload_bytes = base64.urlsafe_b64decode(payload_b64)
+        signature = base64.urlsafe_b64decode(sig_b64)
+    except Exception:
+        raise ValueError("Malformed PQC token format.")
+
+    if not ML_DSA_65.verify(server_pk, payload_bytes, signature):
+        raise ValueError("Invalid ML-DSA-65 token signature.")
+
+    payload = json.loads(payload_bytes.decode("utf-8"))
+    if time.time() > payload.get("exp", 0):
+        raise ValueError("PQC token has expired.")
+
+    return payload
