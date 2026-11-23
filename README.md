@@ -195,7 +195,3 @@ python client.py login alice
 4. **Key Isolation**: Private decapsulation keys never leave the client machine and are stored chunked in OS-managed secure credentials.
 
 ---
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
