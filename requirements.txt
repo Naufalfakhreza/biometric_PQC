@@ -1,0 +1,19 @@
+# Core Post-Quantum Cryptography (NIST FIPS 203 & 204)
+kyber-py>=1.2.0
+dilithium-py>=1.5.1
+
+# Web Framework & HTTP
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+
+# Biometrics & Computer Vision
+deepface>=0.0.90
+opencv-python>=4.10.0
+numpy>=1.26.0
+retina-face>=0.0.17
+
+# OS Credential Storage
+keyring>=25.0.0

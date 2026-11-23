@@ -1,0 +1,32 @@
+# Environment and Secrets
+.env
+*.env.local
+
+# Local biometric secure enclave (keeps biometric vectors and keys local)
+local_enclave/
+
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local benchmarking, testing, and paper figures (user opted not to track in repo)
+test_pqc_face_auth.py
+benchmark_paper_metrics.py
+paper_figures/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
